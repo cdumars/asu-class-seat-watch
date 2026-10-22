@@ -1,0 +1,115 @@
+
+# Watches ASU EEE 439, class #23431 (Spring 2027) for an open seat.
+# When a seat opens, it opens a GitHub issue that @mentions you, which the
+# GitHub mobile app pushes to your phone. The issue closes itself when the
+# class fills again, so the next opening alerts you again.
+#
+# Put this file at .github/workflows/seat-watch.yml in a PUBLIC repo
+# (public repos get unlimited free Actions minutes; a private repo would
+# run out at this frequency).
+
+name: ASU seat watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 min (GitHub may delay runs a few minutes)
+  workflow_dispatch:          # lets you run it by hand from the Actions tab
+
+permissions:
+  issues: write
+
+concurrency:
+  group: seat-watch
+  cancel-in-progress: false
+
+env:
+  CLASS_NBR: "23431"
+  TERM: "2271"                # ASU term code for Spring 2027
+  COURSE: "EEE 439"
+  NOTIFY: "@cdumars"
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check seats
+        id: seats
+        shell: python
+        run: |
+          import json, os, urllib.request
+
+          cls, term = os.environ["CLASS_NBR"], os.environ["TERM"]
+          url = ("https://eadvs-cscc-catalog-api.apps.asu.edu/catalog-microservices/api/v1/"
+                 "search/classes?refine=Y&campusOrOnlineSelection=A&honors=F"
+                 f"&keywords={cls}&promod=F&searchType=all&term={term}")
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+
+          def emit(status, seats="", detail=""):
+              out.write(f"status={status}\nseats={seats}\n")
+              out.write("detail<<EOF\n" + detail + "\nEOF\n")
+              out.flush()
+              print(status, seats, detail)
+
+          try:
+              req = urllib.request.Request(url, headers={
+                  "Authorization": "Bearer null",   # the public class search sends this
+                  "Accept": "application/json",
+                  "User-Agent": "Mozilla/5.0 (seat-watch)",
+              })
+              data = json.load(urllib.request.urlopen(req, timeout=30))
+              match = next((c for c in data.get("classes", [])
+                            if str(c.get("CLAS", {}).get("CLASSNBR", "")).strip() == cls), None)
+              if match is None:
+                  emit("error", detail=f"Class {cls} not found in term {term} search results.")
+              else:
+                  clas = match.get("CLAS", {})
+                  seat = match.get("seatInfo") or {}
+                  cap = int(seat.get("ENRL_CAP", clas.get("ENRLCAP")))
+                  tot = int(seat.get("ENRL_TOT", clas.get("ENRLTOT")))
+                  free = cap - tot
+                  emit("open" if free > 0 else "full", free,
+                       f"{tot}/{cap} enrolled, {free} open.")
+          except Exception as e:
+              emit("error", detail=f"{type(e).__name__}: {e}")
+
+      - name: Notify or clear
+        env:
+          STATUS: ${{ steps.seats.outputs.status }}
+          SEATS: ${{ steps.seats.outputs.seats }}
+          DETAIL: ${{ steps.seats.outputs.detail }}
+        run: |
+          gh label create seat-open     --color 2ea44f --force >/dev/null
+          gh label create monitor-error --color d73a4a --force >/dev/null
+          open_issue() { gh issue list --state open --label "$1" --json number --jq '.[0].number // empty'; }
+
+          SEAT_ISSUE=$(open_issue seat-open)
+          ERR_ISSUE=$(open_issue monitor-error)
+
+          if [ "$STATUS" = "error" ]; then
+            # One issue per outage, not one per run.
+            [ -z "$ERR_ISSUE" ] && gh issue create --label monitor-error \
+              --title "Seat watch can't read $COURSE #$CLASS_NBR" \
+              --body "$NOTIFY the seat check is failing, so openings won't be detected until it's fixed.
+
+          $DETAIL
+
+          Check the latest run in the Actions tab."
+            exit 0
+          fi
+
+          # A successful check clears any earlier error alert.
+          [ -n "$ERR_ISSUE" ] && gh issue close "$ERR_ISSUE" --comment "Checks are working again."
+
+          if [ "$STATUS" = "open" ]; then
+            [ -z "$SEAT_ISSUE" ] && gh issue create --label seat-open \
+              --title "SEAT OPEN: $COURSE #$CLASS_NBR ($SEATS open)" \
+              --body "$NOTIFY a seat opened in $COURSE (class #$CLASS_NBR, Spring 2027). $DETAIL
+
+          Register now in My ASU. Some open seats can be reserved for specific majors or groups, so check the class's reserved-seat info if it won't let you in."
+          else
+            [ -n "$SEAT_ISSUE" ] && gh issue close "$SEAT_ISSUE" --comment "Class is full again. ($DETAIL) Watching for the next opening."
+          fi
+          exit 0
